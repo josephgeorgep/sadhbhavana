@@ -1,0 +1,308 @@
+#include <WiFi.h>
+#include <SD.h>
+#include <Audio.h>
+#include <Arduino.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+
+// String to store the OpenAI response text
+String text;
+// String to store the last answer received from OpenAI, used for replay
+String lastAnswer = "";  
+// Flags to track WiFi connection status and whether the user prompt has been printed
+bool isConnected = false;  
+bool isPromptPrinted = false; 
+
+// --- PRIVATE credentials -----
+const char* ssid = "xxxxxx";   // WiFi SSID
+const char* password = "xxxxxx";   // WiFi password
+const char* OPENAI_KEY = "xxxxxxxxx";  // OpenAI API key
+#define TTS_MODEL 0  // Text-to-Speech model: 1 for OpenAI TTS, 0 for Google TTS
+
+// OpenAI Model settings
+String OpenAI_Model = "gpt-3.5-turbo";  
+float OpenAI_Temperature = 0.0;  // Temperature for deterministic answers (lower value = more deterministic)
+int OpenAI_Max_Tokens = 50;  // Max tokens to limit response length
+
+// File to store the audio recording on the SD card
+#define AUDIO_FILE "/Audio.wav"  
+#define TTS_GOOGLE_LANGUAGE "en-IN"  // Language setting for Google TTS
+
+// --- PIN assignments ---------
+#define pin_RECORD_BTN 36  // Pin used for replay button (SENSOR_VP)
+#define pin_VOL_POTI 34
+#define pin_repeat 13
+
+#define pin_LED_RED 15
+#define pin_LED_GREEN 2
+#define pin_LED_BLUE 4
+
+#define pin_I2S_DOUT 25  // I2S data out pin for audio playback
+#define pin_I2S_LRC 26
+#define pin_I2S_BCLK 27
+
+// --- global Objects ----------
+Audio audio_play;  // Audio object for handling playback
+
+// ------------------------------------------------------------------------------------------------------------------------------
+void setup() {
+  // Initialize serial communication for debugging and user input
+  Serial.begin(115200);
+  Serial.setTimeout(100);  // Set timeout for Serial input
+
+  // Initialize LED pins as outputs
+  pinMode(pin_LED_RED, OUTPUT);
+  pinMode(pin_LED_GREEN, OUTPUT);
+  pinMode(pin_LED_BLUE, OUTPUT);
+
+  // Initialize button pin as input (for replay button)
+  pinMode(pin_RECORD_BTN, INPUT);
+  pinMode(pin_repeat, INPUT);
+
+  // Configure an additional pin for an unknown purpose (possibly to control external hardware)
+  pinMode(12, OUTPUT);
+  digitalWrite(12, LOW);  // Set pin 12 low initially
+
+  // Initial LED startup sequence (RED -> GREEN -> BLUE) for visual feedback
+  led_RGB(50, 0, 0);  // RED
+  delay(500);
+  led_RGB(0, 50, 0);  // GREEN
+  delay(500);
+  led_RGB(0, 0, 50);  // BLUE
+  delay(500);
+  led_RGB(0, 0, 0);   // Turn off all LEDs
+
+  // Initialize WiFi connection using the provided SSID and password
+  WiFi.mode(WIFI_STA);  // Set WiFi mode to station (client)
+  WiFi.begin(ssid, password);  // Start connecting to WiFi network
+  Serial.print("Connecting to WiFi ");
+  checkWiFiStatus();  // Perform an initial check of the WiFi status
+
+  // Initialize the SD card, return if the initialization fails
+  if (!SD.begin()) {
+    return;  // Fail silently if the SD card isn't initialized
+  }
+
+  // Set up the audio object for I2S playback
+  audio_play.setPinout(pin_I2S_BCLK, pin_I2S_LRC, pin_I2S_DOUT);
+  audio_play.setVolume(21);  // Set audio volume (adjust as needed)
+}
+
+// ------------------------------------------------------------------------------------------------------------------------------
+void loop() {
+  // Check if the replay button (SENSOR_VP pin) is pressed
+  if (digitalRead(pin_RECORD_BTN) == LOW) {  // Button pressed (assume active LOW)
+    replayLastAnswer();  // Replay the last OpenAI answer
+    delay(500);  // Debounce delay to avoid multiple button triggers
+  }
+
+  // Check if there's any user input in the Serial Monitor
+  if (Serial.available() > 0) {
+    // Read the user's input (the question) from the Serial Monitor
+    String input = Serial.readStringUntil('\n');
+    input.trim();  // Trim whitespace from the input
+
+    if (input.length() > 0) {
+      Serial.println("Question: " + input);  // Print the user's question for debugging
+
+      // Send the input (question) to the OpenAI API
+      sendToOpenAI(input);
+    }
+  }
+
+  // Periodically check the WiFi connection status
+  checkWiFiStatus();
+
+  // Continue playing audio (loop the audio object if audio is being played)
+  audio_play.loop();
+}
+
+// Function to check the WiFi connection status and update LEDs accordingly
+void checkWiFiStatus() {
+  if (WiFi.status() == WL_CONNECTED) {
+    // If WiFi is connected, turn the LED GREEN and print a status message
+    if (!isConnected) {
+      led_RGB(0, 50, 0);  // GREEN for WiFi connected
+      Serial.println("WiFi connected.");
+      isConnected = true;
+
+      // Print the prompt to enter a question only once after Wi-Fi connects
+      if (!isPromptPrinted) {
+        Serial.println("> You may ask your question now:");
+        isPromptPrinted = true;
+      }
+    }
+  } else {
+    // Flash the RED LED when WiFi is not connected
+    flashRedLED();  
+    if (isConnected) {
+      Serial.println("WiFi not connected.");  // Notify of disconnection
+    }
+    isConnected = false;
+    isPromptPrinted = false;  // Reset the prompt flag when disconnected
+  }
+}
+
+// Function to flash the RED LED when WiFi is disconnected
+void flashRedLED() {
+  static unsigned long lastFlashTime = 0;
+  static bool ledState = false;
+  unsigned long currentTime = millis();
+
+  // Flash the LED every 500ms
+  if (currentTime - lastFlashTime >= 500) {  
+    ledState = !ledState;
+    digitalWrite(pin_LED_RED, ledState ? HIGH : LOW);  // Toggle LED state
+    lastFlashTime = currentTime;
+  }
+
+  // Ensure other LEDs are off
+  analogWrite(pin_LED_GREEN, 0);
+  analogWrite(pin_LED_BLUE, 0);
+}
+
+// Function to send the user's input (question) to the OpenAI API
+void sendToOpenAI(String userText) {
+  WiFiClientSecure client;
+  client.setInsecure();  // Disable SSL certificate validation (insecure but simplifies setup)
+
+  // Connect to the OpenAI API
+  if (client.connect("api.openai.com", 443)) {
+    Serial.println("Connected to OpenAI API.");
+
+    // URL and payload for the OpenAI API request
+    String url = "/v1/chat/completions";
+    String payload = "{\"model\": \"" + OpenAI_Model + "\",\"messages\": [{\"role\": \"user\", \"content\": \"Provide a short and concise answer: " + userText + "\"}], \"temperature\": " + String(OpenAI_Temperature) + ", \"max_tokens\": " + String(OpenAI_Max_Tokens) + "}";
+
+    // Send the POST request to the OpenAI API
+    client.println("POST " + url + " HTTP/1.1");
+    client.println("Host: api.openai.com");
+    client.println("Authorization: Bearer " + String(OPENAI_KEY));
+    client.println("Content-Type: application/json");
+    client.print("Content-Length: ");
+    client.println(payload.length());
+    client.println();
+    client.println(payload);
+
+    // Read the response from the OpenAI API
+    String response;
+    while (client.connected()) {
+      String line = client.readStringUntil('\n');
+      if (line == "\r") {
+        break;
+      }
+    }
+
+    response = client.readString();  // Read the full response
+    parseResponse(response);  // Parse the JSON response
+  } else {
+    Serial.println("Failed to connect to OpenAI API.");  // Handle connection failure
+  }
+
+  client.stop();  // Close the connection
+}
+
+// Function to parse the JSON response from OpenAI
+void parseResponse(String response) {
+  // Extract the JSON portion of the response
+  int jsonStartIndex = response.indexOf("{");
+  int jsonEndIndex = response.lastIndexOf("}");
+
+  // Ensure the response contains valid JSON
+  if (jsonStartIndex != -1 && jsonEndIndex != -1) {
+    String jsonPart = response.substring(jsonStartIndex, jsonEndIndex + 1);
+
+    // Deserialize the JSON response using ArduinoJson
+    DynamicJsonDocument doc(4096);  // Allocate memory for the JSON document
+    DeserializationError error = deserializeJson(doc, jsonPart);
+
+    // Handle deserialization errors
+    if (error) {
+      Serial.println("Failed to parse OpenAI API response.");
+      return;  // Exit if there's a parsing error
+    }
+
+    // Check if the response contains the "choices" field
+    if (doc.containsKey("choices")) {
+      // Loop through the "choices" array and extract the content
+      for (const auto& choice : doc["choices"].as<JsonArray>()) {
+        if (choice.containsKey("message") && choice["message"].containsKey("content")) {
+          text = choice["message"]["content"].as<String>();  // Extract the text
+          text.trim();  // Trim whitespace from the text
+
+          // Store the last answer for replay functionality
+          lastAnswer = text;
+
+          // Print the answer to the Serial Monitor
+          Serial.println("Answer: " + text);
+
+          // Optionally, play the answer using TTS (text-to-speech)
+          if (text != "") {
+            led_RGB(0, 0, 255);  // Turn the LED BLUE to indicate answer is ready
+            if (TTS_MODEL == 1)
+              audio_play.openai_speech(OPENAI_KEY, "tts-1", text.c_str(), "shimmer", "mp3", "1");  // OpenAI TTS
+            else
+              speakTextInChunks(text, 93);  // Google TTS
+          }
+        }
+      }
+    } else {
+      Serial.println("No 'choices' field found in OpenAI response.");
+    }
+  } else {
+    Serial.println("Invalid JSON in OpenAI response.");
+  }
+}
+
+// Function to replay the last answer using TTS
+void replayLastAnswer() {
+  if (lastAnswer != "") {
+    // Print and replay the last answer using TTS
+    Serial.println("Replaying last answer: " + lastAnswer);
+    if (TTS_MODEL == 1)
+      audio_play.openai_speech(OPENAI_KEY, "tts-1", lastAnswer.c_str(), "shimmer", "mp3", "1");  // OpenAI TTS
+    else
+      speakTextInChunks(lastAnswer, 93);  // Google TTS
+  } else {
+    Serial.println("No previous answer available to replay.");
+  }
+}
+
+// Function to split long text into chunks and play them using TTS
+void speakTextInChunks(String text, int maxLength) {
+  int start = 0;
+  while (start < text.length()) {
+    int end = start + maxLength;
+    
+    // Avoid splitting in the middle of a word
+    if (end < text.length()) {
+      while (end > start && text[end] != ' ' && text[end] != '.' && text[end] != ',') {
+        end--;
+      }
+    }
+
+    // If no space or punctuation is found, just split at maxLength
+    if (end == start) {
+      end = start + maxLength;
+    }
+
+    // Extract the chunk and send it to the TTS system for playback
+    String chunk = text.substring(start, end);
+    audio_play.connecttospeech(chunk.c_str(), TTS_GOOGLE_LANGUAGE);
+
+    // Continue looping while audio is playing
+    while (audio_play.isRunning()) {
+      audio_play.loop();
+    }
+
+    // Move to the next part of the text
+    start = end + 1;
+  }
+}
+
+// Function to control the RGB LED (set RED, GREEN, BLUE values)
+void led_RGB(int red, int green, int blue) {
+  analogWrite(pin_LED_RED, red);   // Set RED brightness
+  analogWrite(pin_LED_GREEN, green); // Set GREEN brightness
+  analogWrite(pin_LED_BLUE, blue);  // Set BLUE brightness
+}
